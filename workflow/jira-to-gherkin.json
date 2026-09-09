@@ -1,0 +1,238 @@
+{
+  "name": "Jira ticket to Gherkin test scenarios",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "a1000000-0000-4000-8000-000000000001",
+      "name": "Manual trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-620, 300]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "issue-key-1",
+              "name": "issueKey",
+              "value": "SPORTS-1234",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000002",
+      "name": "Set issue key",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-420, 300],
+      "notes": "Replace with a Jira Trigger node, or a Schedule Trigger plus a JQL search, once you want this to run unattended. Keeping it manual while you tune the prompt means you are not spamming tickets with draft scenarios."
+    },
+    {
+      "parameters": {
+        "resource": "issue",
+        "operation": "get",
+        "issueKey": "={{ $json.issueKey }}",
+        "additionalFields": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000003",
+      "name": "Get Jira issue",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [-200, 300],
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "REPLACE_ME",
+          "name": "Jira Software Cloud account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the prompt from the ticket.\n//\n// Two deliberate choices here.\n//\n// 1. Only the fields that actually inform test design are sent: summary,\n//    description, acceptance criteria, issue type, components and labels.\n//    Sending the whole issue object wastes tokens and, more importantly,\n//    sends reporter names, comment threads and internal links to a third\n//    party for no benefit. Send the minimum the task needs.\n//\n// 2. Acceptance criteria are read from a custom field if present, because on\n//    most boards that is where they live rather than in the description. The\n//    field id differs per Jira instance - find yours at\n//    /rest/api/3/field and change the constant below.\n\nconst CUSTOM_FIELD_ACCEPTANCE_CRITERIA = 'customfield_10100';\n\nconst issue = $input.first().json;\nconst fields = issue.fields || {};\n\n// Jira Cloud returns descriptions in Atlassian Document Format, not plain\n// text. Flatten it rather than stringifying the whole tree.\nfunction adfToText(node) {\n  if (!node) return '';\n  if (typeof node === 'string') return node;\n  if (node.type === 'text') return node.text || '';\n  const children = node.content || [];\n  const text = children.map(adfToText).join('');\n  // Preserve paragraph and list-item breaks so bullet lists survive.\n  return ['paragraph', 'listItem', 'heading'].includes(node.type) ? text + '\\n' : text;\n}\n\nconst description = typeof fields.description === 'string'\n  ? fields.description\n  : adfToText(fields.description);\n\nconst acceptanceCriteria = adfToText(fields[CUSTOM_FIELD_ACCEPTANCE_CRITERIA]);\n\nconst ticket = {\n  key: issue.key,\n  type: fields.issuetype ? fields.issuetype.name : 'Unknown',\n  summary: fields.summary || '',\n  description: description.trim(),\n  acceptanceCriteria: acceptanceCriteria.trim(),\n  components: (fields.components || []).map(c => c.name),\n  labels: fields.labels || []\n};\n\n// Quality gate on the INPUT. A ticket with no description and no acceptance\n// criteria cannot produce useful scenarios, and asking a model to invent them\n// is how you end up with plausible nonsense in a Jira comment. Flag it back\n// to the author instead.\nconst wordCount = (ticket.description + ' ' + ticket.acceptanceCriteria)\n  .split(/\\s+/).filter(Boolean).length;\n\nticket.tooThinToProcess = wordCount < 15;\nticket.wordCount = wordCount;\n\nreturn [{ json: ticket }];"
+      },
+      "id": "a1000000-0000-4000-8000-000000000004",
+      "name": "Extract and check ticket",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [20, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "gate-1",
+              "leftValue": "={{ $json.tooThinToProcess }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000005",
+      "name": "Enough detail to work with?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'claude-sonnet-4-6',\n  max_tokens: 2000,\n  temperature: 0,\n  system: $vars.gherkinSystemPrompt,\n  messages: [\n    {\n      role: 'user',\n      content: 'Ticket: ' + $json.key + '\\nType: ' + $json.type + '\\nSummary: ' + $json.summary + '\\nComponents: ' + $json.components.join(', ') + '\\nLabels: ' + $json.labels.join(', ') + '\\n\\nDescription:\\n' + $json.description + '\\n\\nAcceptance criteria:\\n' + ($json.acceptanceCriteria || '(none supplied)')\n    }\n  ]\n}) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000006",
+      "name": "Generate Gherkin",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "Anthropic API key (header x-api-key)"
+        }
+      },
+      "notes": "A plain HTTP Request node rather than a LangChain AI node, deliberately. It is version-stable, it is obvious what is being sent, and temperature 0 is explicit. The system prompt lives in an n8n variable so it can be changed without editing the workflow. Store the system prompt in Settings > Variables as gherkinSystemPrompt, using the text in prompts/system-prompt.md."
+      },
+    {
+      "parameters": {
+        "jsCode": "// Parse the response and gate it on quality.\n//\n// The point of this node: an AI step in a QA workflow that posts its output\n// straight to Jira is worse than no workflow at all, because a plausible\n// wrong scenario is harder to spot than an empty field. Everything below is\n// a check that the output is structurally usable before a human is asked to\n// review it.\n\nconst response = $input.first().json;\nconst ticket = $('Extract and check ticket').first().json;\n\n// Anthropic returns content as an array of blocks.\nconst text = (response.content || [])\n  .filter(block => block.type === 'text')\n  .map(block => block.text)\n  .join('\\n')\n  .trim();\n\nif (!text) {\n  throw new Error('Empty response from the model for ' + ticket.key);\n}\n\n// Strip a markdown fence if the model wrapped the output in one.\nconst gherkin = text\n  .replace(/^```(?:gherkin|cucumber)?\\s*/i, '')\n  .replace(/```\\s*$/, '')\n  .trim();\n\n// Structural checks. None of these judge whether the scenarios are GOOD -\n// that is the reviewer's job - only whether they are valid Gherkin worth a\n// reviewer's time.\nconst lines = gherkin.split('\\n');\nconst checks = {\n  hasFeature: /^\\s*Feature:/m.test(gherkin),\n  hasScenario: /^\\s*(Scenario|Scenario Outline):/m.test(gherkin),\n  hasGiven: /^\\s*Given /m.test(gherkin),\n  hasWhen: /^\\s*When /m.test(gherkin),\n  hasThen: /^\\s*Then /m.test(gherkin),\n  noPlaceholders: !/(TODO|TBD|<insert|xxx)/i.test(gherkin),\n  noInventedIds: !/\\b(REQ|AC)-\\d+/.test(gherkin) || gherkin.includes(ticket.key)\n};\n\nconst scenarioCount = (gherkin.match(/^\\s*Scenario(?: Outline)?:/gm) || []).length;\nconst failed = Object.entries(checks).filter(([, ok]) => !ok).map(([name]) => name);\n\n// Count negative and boundary coverage. A set of scenarios that is all happy\n// path is the most common failure mode of AI-generated test design, so it is\n// worth surfacing to the reviewer rather than leaving them to notice.\nconst negativeIndicators = (gherkin.match(/\\b(invalid|rejected|refused|error|fails?|empty|blank|missing|unauthorised|unauthorized|expired|exceeds|negative|zero|maximum|minimum|boundary)\\b/gi) || []).length;\n\nreturn [{\n  json: {\n    issueKey: ticket.key,\n    summary: ticket.summary,\n    gherkin,\n    scenarioCount,\n    lineCount: lines.length,\n    structuralChecksFailed: failed,\n    passedStructuralChecks: failed.length === 0,\n    negativeCoverageSignals: negativeIndicators,\n    looksHappyPathOnly: negativeIndicators < 3,\n    inputTokens: response.usage ? response.usage.input_tokens : null,\n    outputTokens: response.usage ? response.usage.output_tokens : null\n  }\n}];"
+      },
+      "id": "a1000000-0000-4000-8000-000000000007",
+      "name": "Parse and validate output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [700, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the Jira comment.\n//\n// The comment is written to be read by a tester, and it is explicit that\n// these are drafts. Framing matters: a comment that reads like finished work\n// gets pasted into a test plan unreviewed, which is the exact outcome this\n// workflow must not produce.\n\nconst d = $input.first().json;\n\nlet warnings = [];\nif (!d.passedStructuralChecks) {\n  warnings.push('Structural checks failed: ' + d.structuralChecksFailed.join(', ') + '. Treat with extra suspicion.');\n}\nif (d.looksHappyPathOnly) {\n  warnings.push('Low negative and boundary coverage detected. The generated set looks happy-path heavy - add the negative cases yourself before using this.');\n}\n\nconst warningBlock = warnings.length\n  ? '\\n{panel:bgColor=#fffae6}\\n*Check before use*\\n' + warnings.map(w => '- ' + w).join('\\n') + '\\n{panel}\\n'\n  : '';\n\nconst comment = [\n  'h3. Draft Gherkin scenarios (AI-generated, unreviewed)',\n  '',\n  'Generated from the description and acceptance criteria on this ticket. ' +\n  '*These are a starting point for test design, not test cases.* ' +\n  'They have not been reviewed by a tester and they may miss domain rules that are not written on the ticket.',\n  warningBlock,\n  '{code:gherkin}',\n  d.gherkin,\n  '{code}',\n  '',\n  '----',\n  '_Scenarios: ' + d.scenarioCount + ' | Lines: ' + d.lineCount + '_',\n  '_Generated by n8n workflow \"Jira ticket to Gherkin test scenarios\"_',\n  '',\n  'Reviewer: delete this comment and replace it with the reviewed set, or reply with what it got wrong so the prompt can be improved.'\n].join('\\n');\n\nreturn [{ json: { issueKey: d.issueKey, comment } }];"
+      },
+      "id": "a1000000-0000-4000-8000-000000000008",
+      "name": "Format Jira comment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [920, 200]
+    },
+    {
+      "parameters": {
+        "resource": "issueComment",
+        "operation": "add",
+        "issueKey": "={{ $json.issueKey }}",
+        "comment": "={{ $json.comment }}",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000009",
+      "name": "Post draft to Jira",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [1140, 200],
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "REPLACE_ME",
+          "name": "Jira Software Cloud account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// The ticket was too thin to generate anything useful from.\n//\n// This branch exists because the alternative - generating scenarios from a\n// one-line ticket - produces confident invented requirements. Asking the\n// author for detail is the correct output, and it is also a genuinely useful\n// shift-left nudge.\n\nconst t = $input.first().json;\n\nconst comment = [\n  'h3. Not enough detail to draft test scenarios',\n  '',\n  'This ticket has ' + t.wordCount + ' words across its description and acceptance criteria, which is not enough to design tests from without inventing requirements.',\n  '',\n  'To draft scenarios automatically, the ticket needs:',\n  '* what the user is trying to do',\n  '* the acceptance criteria, including what should happen when things go wrong',\n  '* any boundaries - limits, minimums, maximums, states the feature depends on',\n  '',\n  '_Generated by n8n workflow \"Jira ticket to Gherkin test scenarios\"_'\n].join('\\n');\n\nreturn [{ json: { issueKey: t.key, comment } }];"
+      },
+      "id": "a1000000-0000-4000-8000-000000000010",
+      "name": "Request more detail",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 440]
+    },
+    {
+      "parameters": {
+        "resource": "issueComment",
+        "operation": "add",
+        "issueKey": "={{ $json.issueKey }}",
+        "comment": "={{ $json.comment }}",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000011",
+      "name": "Ask author for detail",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [700, 440],
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "REPLACE_ME",
+          "name": "Jira Software Cloud account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Manual trigger": {
+      "main": [[{ "node": "Set issue key", "type": "main", "index": 0 }]]
+    },
+    "Set issue key": {
+      "main": [[{ "node": "Get Jira issue", "type": "main", "index": 0 }]]
+    },
+    "Get Jira issue": {
+      "main": [[{ "node": "Extract and check ticket", "type": "main", "index": 0 }]]
+    },
+    "Extract and check ticket": {
+      "main": [[{ "node": "Enough detail to work with?", "type": "main", "index": 0 }]]
+    },
+    "Enough detail to work with?": {
+      "main": [
+        [{ "node": "Generate Gherkin", "type": "main", "index": 0 }],
+        [{ "node": "Request more detail", "type": "main", "index": 0 }]
+      ]
+    },
+    "Generate Gherkin": {
+      "main": [[{ "node": "Parse and validate output", "type": "main", "index": 0 }]]
+    },
+    "Parse and validate output": {
+      "main": [[{ "node": "Format Jira comment", "type": "main", "index": 0 }]]
+    },
+    "Format Jira comment": {
+      "main": [[{ "node": "Post draft to Jira", "type": "main", "index": 0 }]]
+    },
+    "Request more detail": {
+      "main": [[{ "node": "Ask author for detail", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    { "name": "qa" },
+    { "name": "test-design" },
+    { "name": "ai" }
+  ]
+}
